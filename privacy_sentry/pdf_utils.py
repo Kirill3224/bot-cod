@@ -1,30 +1,48 @@
 # -*- coding: utf-8 -*-
 """
-Допоміжний модуль для генерації PDF з Markdown.
-(v2.8) - Повернено до чистої Markdown-логіки (v2.7).
-Використовує 'pdfkit' та 'markdown2'.
+Генерація PDF з Markdown (PDF-only).
+(v3.2 - Взято у товариша)
+Черга спроб:
+  A) pdfkit + wkhtmltopdf (рекомендовано; шлях можна задати через env WKHTMLTOPDF_CMD)
+  B) xhtml2pdf (pisa) — працює без зовнішніх бінарників (CSS дещо скромніший)
+
+Якщо жоден варіант недоступний — піднімається виняток із чіткою інструкцією, що встановити.
 """
 
-import pdfkit
-import markdown2
 import logging
 import os
-import html
+from typing import Optional
 
-# Налаштування логера для цього модуля
+import markdown2
+
 logger = logging.getLogger("pdf_utils")
 logger.setLevel(logging.INFO)
 
-# --- (ОНОВЛЕНО v2.8) CSS СТИЛІ ДЛЯ PDF (Чистий Markdown) ---
-# (Видалено непотрібні HTML-класи .category-header, .status-yes, .status-no)
+# --- Ліниві імпорти, щоб не падати, якщо пакетів немає ---
+def _try_import_pdfkit():
+    try:
+        import pdfkit  # type: ignore
+        return pdfkit
+    except Exception:
+        return None
+
+def _try_import_xhtml2pdf():
+    try:
+        from xhtml2pdf import pisa  # type: ignore
+        return pisa
+    except Exception:
+        return None
+
+# --- Стилі, наближені до нашої v2.8 (чисті шрифти, охайні таблиці) ---
 PDF_CSS_STYLE = """
 <style>
+    @page { size: A4; margin: 20mm 17mm 22mm 17mm; }
     body {
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif,
+                     "Apple Color Emoji","Segoe UI Emoji","Segoe UI Symbol";
         font-size: 11pt;
         line-height: 1.5;
         color: #333;
-        padding: 2cm;
     }
     h1, h2, h3, h4 {
         font-family: "Georgia", serif;
@@ -43,10 +61,7 @@ PDF_CSS_STYLE = """
         padding: 2px 4px;
         font-size: 90%;
     }
-    pre {
-        padding: 10px 15px;
-        overflow-x: auto;
-    }
+    pre { padding: 10px 15px; overflow-x: auto; }
     table {
         width: 100%;
         border-collapse: collapse;
@@ -59,80 +74,118 @@ PDF_CSS_STYLE = """
         text-align: left;
         vertical-align: top;
     }
-    th {
-        background-color: #f9f9f9;
-        font-weight: bold;
-    }
+    th { background-color: #f9f9f9; font-weight: bold; }
     /* Стиль для першої колонки (Питання) в DPIA */
-    table td:first-child {
-        font-weight: bold;
-        background-color: #fdfdfd;
-        width: 30%; /* Фіксована ширина для першої колонки */
+    table td:first-child { 
+        font-weight: bold; 
+        background-color: #fdfdfd; 
+        width: 30%; 
     }
-    blockquote {
-        border-left: 4px solid #eee;
-        padding-left: 15px;
-        color: #555;
-        font-style: italic;
-    }
+    blockquote { border-left: 4px solid #eee; padding-left: 15px; color: #555; font-style: italic; }
+    /* Спеціально для xhtml2pdf, щоб <br> працював у таблицях */
+    br { display: block; content: ""; margin-bottom: 0.5em; } 
 </style>
 """
 
-def create_pdf_from_markdown(content: str, is_html: bool, output_filename: str) -> str:
-    """
-    (ОНОВЛЕНО v2.8)
-    Генерує PDF з Markdown. Параметр 'is_html' ігнорується,
-    оскільки ми ЗАВЖДИ генеруємо з Markdown.
-    
-    :param content: Рядок, що містить Markdown.
-    :param is_html: (Ігнорується)
-    :param output_filename: Шлях до вихідного PDF.
-    :return: Шлях до вихідного PDF.
-    """
-    logger.info(f"Починаю генерацію PDF (Режим Markdown v2.8): {output_filename}")
+def _md_to_html(md_content: str) -> str:
+    """Конвертує Markdown (з нашими шаблонами v2.8) в HTML."""
+    html_body = markdown2.markdown(
+        md_content,
+        extras=["tables", "fenced-code-blocks", "strike", "cuddled-lists", "break-on-newline"]
+    )
+    return f"<html><head><meta charset='UTF-8'>{PDF_CSS_STYLE}</head><body>{html_body}</body></html>"
+
+def _generate_with_pdfkit(html_full: str, output_filename: str) -> bool:
+    """Спроба 1: Генерація через pdfkit (wkhtmltopdf)."""
+    pdfkit = _try_import_pdfkit()
+    if not pdfkit:
+        logger.warning("Бібліотека 'pdfkit' не встановлена. Пропускаю...")
+        return False
 
     try:
-        # (v2.8) Ми ЗАВЖДИ використовуємо 'markdown2'
-        logger.info("Режим Markdown (v2.8). Використовуємо 'markdown2'.")
-        html_content = markdown2.markdown(
-            content,
-            extras=["tables", "fenced-code-blocks", "strike", "cuddled-lists", "break-on-newline"]
-        )
+        # Шукаємо wkhtmltopdf
+        wkhtmltopdf_path_env = os.getenv("WKHTMLTOPDF_CMD")
+        config = None
+        if wkhtmltopdf_path_env and os.path.exists(wkhtmltopdf_path_env):
+            logger.info(f"Використовую wkhtmltopdf з WKHTMLTOPDF_CMD: {wkhtmltopdf_path_env}")
+            config = pdfkit.configuration(wkhtmltopdf=wkhtmltopdf_path_env)
         
-        # 3. Додаємо CSS стилі
-        html_full = f"<html><head><meta charset='UTF-8'>{PDF_CSS_STYLE}</head><body>{html_content}</body></html>"
-        
-        # 4. Налаштування для pdfkit
         options = {
-            'page-size': 'A4',
-            'margin-top': '1in',
-            'margin-right': '0.75in',
-            'margin-bottom': '1in',
-            'margin-left': '0.75in',
             'encoding': "UTF-8",
+            'page-size': 'A4',
+            'margin-top': '20mm',
+            'margin-bottom': '22mm',
+            'margin-left': '17mm',
+            'margin-right': '17mm',
             'quiet': ''
         }
         
-        # 5. Генеруємо PDF
-        pdfkit.from_string(html_full, output_filename, options=options)
-        
-        logger.info(f"PDF успішно створено: {output_filename}")
-        return output_filename
-
+        pdfkit.from_string(html_full, output_filename, options=options, configuration=config)
+        return True
+    
     except IOError as e:
         if "No wkhtmltopdf executable found" in str(e):
-            logger.error("!!! 'wkhtmltopdf' не знайдено. !!!")
-            logger.error("Будь ласка, встановіть 'wkhtmltopdf' у вашій системі.")
-            logger.error("Debian/Ubuntu: sudo apt install wkhtmltopdf")
-            logger.error("Arch/Manjaro (AUR): yay -S wkhtmltopdf-static")
-            logger.error("Fedora: sudo dnf install wkhtmltopdf")
-            raise Exception("Помилка на сервері: 'wkhtmltopdf' не встановлено. PDF не може бути створений.")
+            logger.warning("wkhtmltopdf не знайдено у PATH. Спроба 2: xhtml2pdf...")
         else:
-            logger.error(f"Помилка вводу-виводу під час генерації PDF: {e}", exc_info=True)
-            raise e
+            logger.error(f"pdfkit впав з помилкою вводу-виводу: {e}")
+        return False
     except Exception as e:
-        logger.error(f"Невідома помилка під час генерації PDF: {e}", exc_info=True)
-        raise e
+        logger.error(f"pdfkit впав з невідомою помилкою: {e}")
+        return False
+
+def _generate_with_xhtml2pdf(html_full: str, output_filename: str) -> bool:
+    """Спроба 2: Генерація через xhtml2pdf (чистий Python)."""
+    pisa = _try_import_xhtml2pdf()
+    if not pisa:
+        logger.warning("Бібліотека 'xhtml2pdf' не встановлена. Пропускаю...")
+        return False
+    
+    try:
+        with open(output_filename, "w+b") as result_file:
+            # Конвертуємо HTML в PDF
+            pisa_status = pisa.CreatePDF(
+                html_full,                # HTML-вміст
+                dest=result_file,         # Файл
+                encoding='utf-8'
+            )
+        
+        if not pisa_status.err:
+            logger.info("PDF успішно створено через xhtml2pdf.")
+            return True
+        else:
+            logger.error(f"xhtml2pdf впав з помилкою: {pisa_status.err}")
+            return False
+            
+    except Exception as e:
+        logger.warning(f"xhtml2pdf впав: {e}")
+        return False
+
+def create_pdf_from_markdown(content: str, is_html: bool, output_filename: str) -> str:
+    """
+    (ОНОВЛЕНО v2.9)
+    Генерує *PDF-файл* з Markdown.
+    Повертає шлях до PDF (output_filename). Якщо PDF створити не вийшло — піднімає виняток з інструкцією.
+    """
+    logger.info(f"Старт генерації PDF (v2.9 Гібрид): {output_filename}")
+    # is_html ігнорується, ми завжди передаємо Markdown з v2.8
+    html_full = _md_to_html(content)
+
+    # A) wkhtmltopdf (краща якість)
+    if _generate_with_pdfkit(html_full, output_filename):
+        logger.info(f"PDF створено через wkhtmltopdf: {output_filename}")
+        return output_filename
+
+    # B) xhtml2pdf (без зовнішніх бінарників)
+    if _generate_with_xhtml2pdf(html_full, output_filename):
+        logger.info(f"PDF створено через xhtml2pdf: {output_filename}")
+        return output_filename
+
+    # Обидва варіанти недоступні → пояснюємо, що встановити
+    raise Exception(
+        "Не вдалося створити PDF.\n\n"
+        "**Варіант A (рекомендовано):** Встановіть `wkhtmltopdf` у вашій системі (напр., `sudo apt install wkhtmltopdf`).\n"
+        "**Варіант B (запасний):** Встановіть `xhtml2pdf` (`pip install xhtml2pdf`)."
+    )
 
 def clear_temp_file(filepath: str):
     """Видаляє тимчасовий PDF-файл після надсилання."""
